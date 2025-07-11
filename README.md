@@ -10,7 +10,8 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.IOException
 import java.io.InputStreamReader
-import java.util.UUID
+import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -18,26 +19,30 @@ class MCPService : Service() {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // SSE requires infinite read
+        .readTimeout(0, TimeUnit.MILLISECONDS) // infinite read for SSE
+        .retryOnConnectionFailure(true)
         .build()
 
     private val executor = Executors.newSingleThreadExecutor()
     private val mcpUrl = "http://10.0.2.2:8000/mcp/"
-    private var currentRequestId: String = ""
+
+    // Track multiple outstanding requests
+    private val pendingRequests = ConcurrentHashMap<String, String>()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        sendJsonRequestThenListen()
+        sendJsonRpcRequest("tools/list", JSONObject())
+        listenToSSE()
         return START_STICKY
     }
 
-    private fun sendJsonRequestThenListen() {
-        currentRequestId = UUID.randomUUID().toString()
+    private fun sendJsonRpcRequest(method: String, params: JSONObject) {
+        val requestId = UUID.randomUUID().toString()
 
         val jsonRequest = JSONObject().apply {
             put("jsonrpc", "2.0")
-            put("id", currentRequestId)
+            put("id", 1)
             put("method", "tools/list")
-            put("params", JSONObject())
+            put("params", JSONObject().apply{})
         }
 
         val requestBody = RequestBody.create(
@@ -50,17 +55,20 @@ class MCPService : Service() {
             .post(requestBody)
             .build()
 
+        pendingRequests[requestId] = method
+
         client.newCall(postRequest).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                Log.e("MCPService", "POST request failed: ${e.message}")
+                Log.e("MCPService", "❌ JSON-RPC POST failed: ${e.message}")
+                pendingRequests.remove(requestId)
             }
 
             override fun onResponse(call: Call, response: Response) {
                 if (response.isSuccessful) {
-                    Log.d("MCPService", "POST succeeded with id: $currentRequestId. Starting SSE...")
-                    listenToSSE()
+                    Log.d("MCPService", "✅ Sent method '$method' with id=$requestId")
                 } else {
-                    Log.e("MCPService", "POST request error: ${response.code}")
+                    Log.e("MCPService", "❌ JSON-RPC error: ${response.code}")
+                    pendingRequests.remove(requestId)
                 }
             }
         })
@@ -73,64 +81,75 @@ class MCPService : Service() {
             .build()
 
         executor.execute {
-            try {
-                client.newCall(getRequest).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        Log.e("MCPService", "SSE connection failed: $response")
-                        return@execute
-                    }
+            while (!executor.isShutdown) {
+                try {
+                    client.newCall(getRequest).execute().use { response ->
+                        if (!response.isSuccessful) {
+                            Log.e("MCPService", "❌ Failed SSE connection: ${response.code}")
+                            Thread.sleep(3000)
+                            return@use
+                        }
 
-                    val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
-                    var line: String?
-                    var event: String? = null
-                    val dataBuilder = StringBuilder()
+                        val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
+                        var event: String? = null
+                        val dataBuilder = StringBuilder()
+                        var line: String?
 
-                    while (reader.readLine().also { line = it } != null) {
-                        line = line?.trim()
+                        while (reader.readLine().also { line = it } != null) {
+                            line = line?.trim()
+                            when {
+                                line!!.startsWith("event:") -> {
+                                    event = line!!.removePrefix("event:").trim()
+                                }
 
-                        if (line!!.startsWith("event:")) {
-                            event = line!!.removePrefix("event:").trim()
-                        } else if (line!!.startsWith("data:")) {
-                            dataBuilder.append(line!!.removePrefix("data:").trim())
-                        } else if (line!!.isEmpty()) {
-                            // End of one SSE event block
-                            val fullData = dataBuilder.toString()
-                            if (event != null && fullData.isNotEmpty()) {
-                                Log.d("SSE_RAW", "event=$event, data=$fullData")
-                                handleIncomingSSE(event!!, fullData)
+                                line!!.startsWith("data:") -> {
+                                    dataBuilder.append(line!!.removePrefix("data:").trim())
+                                }
+
+                                line!!.isEmpty() -> {
+                                    val fullData = dataBuilder.toString()
+                                    if (event != null && fullData.isNotEmpty()) {
+                                        Log.d("SSE_RAW", "event=$event, data=$fullData")
+//                                        handleIncomingSSE(event!!, fullData)
+                                    }
+                                    event = null
+                                    dataBuilder.setLength(0)
+                                }
                             }
-                            // Reset for next event
-                            event = null
-                            dataBuilder.setLength(0)
                         }
                     }
+                } catch (e: Exception) {
+                    Log.e("MCPService", "❌ SSE error: ${e.message}")
+                    Thread.sleep(3000)
                 }
-            } catch (e: Exception) {
-                Log.e("MCPService", "SSE Error: ${e.message}")
             }
         }
     }
 
-    private fun handleIncomingSSE(event: String, data: String) {
-        try {
-            val json = JSONObject(data)
-            val incomingId = json.optString("id", "")
-
-            if (incomingId == currentRequestId) {
-                Log.i("MCPService", "✅ Matched SSE [$event] for id=$incomingId: $data")
-                // TODO: Handle the matched result here
-            } else {
-                Log.i("MCPService", "🔁 Ignored SSE [$event] for id=$incomingId (expected $currentRequestId)")
-            }
-        } catch (e: Exception) {
-            Log.e("MCPService", "❌ Invalid SSE JSON data: $data")
-        }
-    }
+//    private fun handleIncomingSSE(event: String, data: String) {
+//        try {
+//            val json = JSONObject(data)
+//            val incomingId = json.optString("id", "")
+//
+//            if (pendingRequests.containsKey(incomingId)) {
+//                val method = pendingRequests[incomingId]
+//                Log.i("MCPService", "✅ Matched SSE for method='$method', id=$incomingId → result: $data")
+//                pendingRequests.remove(incomingId)
+//
+//                // TODO: Dispatch result to Activity or ViewModel if needed
+//            } else {
+//                Log.w("MCPService", "⚠️ Unmatched SSE id=$incomingId, ignoring or notify user")
+//            }
+//        } catch (e: Exception) {
+//            Log.e("MCPService", "❌ Failed to parse SSE data: $data")
+//        }
+//    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         executor.shutdownNow()
+        pendingRequests.clear()
         super.onDestroy()
     }
 }
